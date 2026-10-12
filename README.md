@@ -1,11 +1,18 @@
 # Embodied-Harness
 
-A ROS2 Humble-based control system for box-handling tasks with the G1 humanoid
-robot. It provides a **main page** for nine-cell grid selection and live progress,
-plus a **debug console** for step-by-step debugging and automatic execution.
-ROS2 services and topics connect TaskManger to Gateway (C++ motion control),
-Navigation (path planning), and FoundationPose (6DoF pose estimation) to coordinate
-**walking, lifting a box, carrying it, and placing it down**.
+**An agent harness for visually grounded robot tasks on the Unitree G1.**
+
+Embodied-Harness connects a cloud vision-language planner to robot perception,
+navigation, and manipulation through a local execution runtime built on ROS 2
+Humble. The agent grounds natural-language instructions in scene observations
+and generates semantic task plans. The harness validates those plans, dispatches
+robot skills, maintains mission state, and returns action evidence for
+closed-loop verification and replanning.
+
+The current integration connects FoundationPose, Navigation, and the G1 motion
+Gateway. A web console provides natural-language task submission, monitoring,
+intervention, and replay. Task execution belongs to the local Supervisor and
+does not depend on an operator advancing each stage in the browser.
 
 ## Demo
 
@@ -13,65 +20,92 @@ https://github.com/user-attachments/assets/59934c96-b3b6-48cb-a8c2-f17d752b9a03
 
 ## System Architecture
 
+The **agent** makes grounded planning and verification decisions. The
+**harness** supplies the observation context, semantic tools, execution
+constraints, persistent state, and feedback loop around those decisions.
+
 ```text
-Browser
-├─ Main page (index.html :4173)
-│  ├─ Plan a route on the nine-cell grid
-│  ├─ RUN → POST /load to load the plan
-│  └─ Live progress via SSE /stream
-└─ Debug console (debug.html)
-   ├─ Step list
-   ├─ Automatic execution (FP select_target)
-   └─ Manual controls
-               │ HTTP + SSE
-               ▼
-TaskManger (Flask :5000)
-└─ phi_robot/
-   ├─ api_server.py              REST API + SSE endpoints
-   ├─ step_debug.py              StepDebugController (step execution engine)
-   ├─ mission_planner.py         Task planning (grid → execution steps)
-   ├─ robot_state.py             SafetyStateMachine (9 states)
-   ├─ service_manager.py         Remote service management (systemd over SSH)
-   ├─ robot_profile.py           Multi-robot profiles
-   └─ adapters/ros_acceptance.py ROS2 adapter
-               │ ROS2 Service / Topic / Action
-               ▼
-ROS2 Integration Layer
-├─ goal_bridge       /start_navigation → /goal_pose
-├─ ZMQ Bridge        CycloneDDS (robot) ↔ Fast-DDS (workstation)
-└─ FoundationPose    /foundationpose/select_target
-               │
-               ▼
-G1 Robot (Orin)
-├─ Gateway (C++)     Motion control (lift/lay_down/stand/replay)
-├─ SONIC             Whole-body control policy
-├─ FAST-LIO          LiDAR-inertial odometry
-└─ Nav2              Path planning
+Natural-language instruction
+        |
+        v
+Web Console / Task API
+        |
+        v
+Planner Agent + Closed-loop Controller <--> Model Gateway <--> Cloud VLM
+        ^       |
+        |       v
+        |  GoalSpec + PlanGraph / PlanRevision
+        |       |
+        |       v
+        |  Execution Supervisor <---- Local stop / drop interrupt
+        |       |
+        |       v
+        |  Semantic Skill Registry + Shared Dispatcher
+        |       |
+        |       v
+        |  ROS 2 Adapters --> Navigation / FoundationPose / Gateway --> G1
+        |       |
+        +-------+-- Observations, World State, and action results
 ```
 
-**Key data flows**:
-
-| Flow | Path | Notes |
+| Layer | Responsibility | Implementation |
 |---|---|---|
-| Navigation goal | TaskManger → `/start_navigation` → goal_bridge → `/goal_pose` → Nav2 | |
-| Arrival confirmation | Nav2 → `/nav_reached` → ZMQ Bridge → TaskManger | |
-| Motion control | TaskManger → Gateway services (`/set_lift`, `/set_lay_down`, etc.) | |
-| Pose estimation | FoundationPose `/foundationpose/pose_results` → TaskManger | pelvis frame |
-| Mode switching | TaskManger → `/locomotion_mode` (Topic) → Gateway | 1 = walking, 2 = carrying |
-| Navigation pause | TaskManger → `/nav_pause` (Topic) → ZMQ Bridge → Nav2 | |
-| Drop detection | FoundationPose `/vision/drop_detector_enable` → Gateway | |
+| Planner and model gateway | Ground instructions against observed objects, generate structured semantic plans, and validate model responses against the current observation and world version. | [`planner_agent.py`](phi_robot/autonomy/planner_agent.py), [`model_gateway.py`](phi_robot/autonomy/model_gateway.py) |
+| Execution runtime | Own the active mission, execute plans in the background, persist action history, and manage interruption and reconciliation. | [`runtime.py`](phi_robot/autonomy/runtime.py), [`supervisor.py`](phi_robot/autonomy/supervisor.py), [`ledger.py`](phi_robot/autonomy/ledger.py) |
+| Semantic skills and adapters | Expose task-level tools such as `move_to_location`, `select_object`, `pick_object`, and `verify_placement`; translate them into existing robot interfaces. | [`agent_tools.py`](phi_robot/autonomy/agent_tools.py), [`skills/`](phi_robot/skills/), [`ros_bridge.py`](phi_robot/autonomy/ros_bridge.py) |
+| Observations and world state | Combine timestamped visual evidence, object identities, symbolic destinations, and robot state for grounded decisions. | [`observations.py`](phi_robot/autonomy/observations.py), [`objects.py`](phi_robot/autonomy/objects.py), [`locations.py`](phi_robot/autonomy/locations.py), [`world_state.py`](phi_robot/autonomy/world_state.py) |
+| Verification and recovery | Evaluate action outcomes, request fresh evidence, revise the unexecuted plan tail, and coordinate transport-drop recovery after confirmed local stop. | [`closed_loop.py`](phi_robot/autonomy/closed_loop.py), [`recovery.py`](phi_robot/autonomy/recovery.py) |
+| Console and replay | Submit instructions and inspect missions, plan revisions, model decisions, action results, events, and metrics. | [`AutonomyConsole.jsx`](phi_robot_fronted/src/AutonomyConsole.jsx), [`service.py`](phi_robot/autonomy/service.py), [`evaluation.py`](phi_robot/autonomy/evaluation.py) |
+
+### Execution Boundaries
+
+- **Grounded goals:** `ObjectRef` separates logical object identity from
+  perception IDs; `LocationRef` keeps destinations symbolic. The current
+  executable destination resolver supports the nine-cell grid.
+- **Controlled physical execution:** agent actions use validated semantic plans
+  and the Supervisor. Autonomous and legacy developer actions share one
+  dispatcher and per-robot writer lock in the deployed composition. The model
+  does not receive raw ROS, joint, velocity, or service-administration authority.
+- **Explicit uncertainty:** stale observations are rejected, unknown physical
+  outcomes require reconciliation, and replanning preserves dispatched action
+  history rather than silently retrying it.
+- **Local interruption:** stop requests use an independent interrupt lane. A
+  transport-drop event requests local stop before model-based diagnosis;
+  recovery requires confirmed stop and a resolved prior action.
+- **Traceable decisions:** durable ledgers link model calls, frame hashes, plan
+  revisions, skill invocations, and events for inspection and replay.
+
+The architecture has offline/replay test coverage; end-to-end cloud-driven
+missions and transport-drop recovery still require real-robot acceptance
+testing. See the [planner](docs/autonomy/phase5/implementation.md),
+[recovery](docs/autonomy/phase7/implementation.md), and
+[console/replay](docs/autonomy/phase8/implementation.md) validation notes.
 
 ## Repository Structure
 
 ```text
-TaskManger/
+Embodied-Harness/
 ├── phi_robot/                          # Backend Python package
+│   ├── autonomy/                      # Agent harness and local execution runtime
+│   │   ├── planner_agent.py           # Natural-language grounding and semantic planning
+│   │   ├── model_gateway.py           # Structured model calls and offline replay provider
+│   │   ├── gemini_provider.py         # Gemini multimodal provider adapter
+│   │   ├── runtime.py                 # Per-robot runtime ownership
+│   │   ├── supervisor.py              # Background plan execution and interruption
+│   │   ├── agent_tools.py             # Planner-visible semantic skill contracts
+│   │   ├── ros_bridge.py              # Observation and semantic ROS adapters
+│   │   ├── closed_loop.py             # Verification and plan-tail revision
+│   │   ├── recovery.py                # Transport-drop recovery coordination
+│   │   ├── ledger.py                  # Durable mission, action, and event history
+│   │   ├── evaluation.py              # Replay bundles and mission metrics
+│   │   └── deployment.py              # Shared agent / legacy deployment composition
+│   ├── skills/                        # Versioned registry, dispatcher, and compatibility layer
 │   ├── adapters/
 │   │   └── ros_acceptance.py           # ROS2 adapter for Gateway/Nav/FP integration
 │   ├── api_server.py                   # Flask API server (REST + SSE)
 │   ├── step_debug.py                   # Step-by-step controller (StepDebugController)
 │   ├── dev_console.py                  # Debug console controller
-│   ├── mission_planner.py              # Task planner (grid coordinates → steps)
+│   ├── mission_planner.py              # Legacy grid-to-step task planner
 │   ├── mission_runner.py               # Task execution engine
 │   ├── mission_service.py              # Task persistence
 │   ├── robot_state.py                  # SafetyStateMachine (9 states + allowed transitions)
@@ -87,7 +121,8 @@ TaskManger/
 │   ├── index.html                      # Main page entry point
 │   ├── debug.html                      # Debug console entry point
 │   └── src/
-│       ├── App.jsx                     # Main page: grid + SSE progress
+│       ├── App.jsx                     # Autonomy console by default; legacy grid via ?developer=1
+│       ├── AutonomyConsole.jsx         # Instructions, readiness, mission monitoring, and replay
 │       ├── debug-main.jsx              # Debug page entry point
 │       ├── DeveloperConsole.jsx        # Debug console
 │       ├── StepDebugPanel.jsx          # Step-by-step debug panel
@@ -110,7 +145,8 @@ TaskManger/
 │   └── start_foundationpose.sh
 ├── robot_interfaces/                   # ExecuteTrajectory service definition
 ├── phi_robot_interfaces/               # Custom phi_robot interfaces
-├── run_phi_robot_api.py                # Backend entry point
+├── run_autonomy_api.py                 # Agent harness entry point (explicit opt-in)
+├── run_phi_robot_api.py                # Legacy backend entry point
 ├── run_ros_acceptance.sh               # ROS2 integration startup script
 └── requirements.txt                    # Python dependencies
 ```
@@ -292,13 +328,17 @@ fresh `/odom` samples showing low velocity. Insufficient evidence leaves the
 system awaiting operator intervention; successful publication alone does not
 prove that the robot has stopped.
 
-## Quick Start
+## Quick Start (Legacy ROS Setup)
+
+The commands below start the legacy ROS backend and developer tools. For the
+agent harness entry point, see the [autonomous runtime configuration](#configuration)
+and its deployment validation requirements.
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/HenryLiu0405/TaskManger.git
-cd TaskManger
+git clone https://github.com/HenryLiu0405/Embodied-Harness.git
+cd Embodied-Harness
 ```
 
 ### 2. Build the ROS2 Interface Packages
@@ -368,13 +408,18 @@ npm run dev
 
 | Page | URL | Purpose |
 |------|------|------|
-| Main page | `http://localhost:4173/` | Draw a route on the grid and load the plan |
-| Debug console | `http://localhost:4173/debug.html` | Step-by-step debugging / automatic execution (FP select_target) |
+| Autonomy console | `http://localhost:4173/` | Natural-language tasks, readiness, mission monitoring, and replay; requires the autonomous backend |
+| Developer page | `http://localhost:4173/?developer=1` | Legacy grid route selection and live step progress |
+| Debug console | `http://localhost:4173/debug.html` | Legacy step-by-step debugging / automatic execution (FP select_target) |
 
-## Dual-Interface Workflow
+## Legacy Developer Workflow
+
+The grid and step-debug interfaces remain available for compatibility and
+diagnostics. They are separate from the default natural-language console and
+do not define the Agent's planning loop.
 
 ```text
-Main page (index.html)                 Debug console (debug.html)
+Developer page (?developer=1)          Debug console (debug.html)
         │                                      │
 Draw a grid route and click RUN        Inspect the loaded plan
         │                                      │
@@ -389,9 +434,9 @@ UnifiedConsole: progress markers
 StepDetailPanel: step status
 ```
 
-**Key design**: the main-page RUN workflow and debug-console automatic execution
+**Legacy behavior**: the developer-page RUN workflow and debug-console automatic execution
 share the same execution engine, `StepDebugController._run_auto()`, including
-automatic single-object locking through FP `select_target`. The main page
+automatic single-object locking through FP `select_target`. The developer page
 receives live step updates through SSE without polling.
 
 ## Switching Robots
