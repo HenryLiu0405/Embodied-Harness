@@ -1,4 +1,4 @@
-# WAIC TaskManger
+# Embodied-Harness
 
 A ROS2 Humble-based control system for box-handling tasks with the G1 humanoid
 robot. It provides a **main page** for nine-cell grid selection and live progress,
