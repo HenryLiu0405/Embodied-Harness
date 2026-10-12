@@ -1,170 +1,168 @@
 # WAIC TaskManger
 
-基于 ROS2 Humble 的 G1 人形机器人搬运控制系统。双界面架构：**主页**（九宫格选点 + 实时进度） + **调试控制台**（分步调试 + 自动执行），通过 ROS2 Service/Topic 与 Gateway（C++ 运动网关）、Navigation（路径规划）、FoundationPose（6DoF 位姿估计）对接，实现**行走、搬起箱子、携带行走、放下箱子**全流程闭环。
-
-> 自主化开发状态（2026-08-03）：仓库已加入 Phase 2–8 的离线实现切片。
-> 默认主页现为自然语言任务提交与监控台，旧九宫格/分步工具保留在
-> `?developer=1`。现有 Navigation、FoundationPose、Gateway 已由薄语义桥接入
-> 同一个 Supervisor，并提供配置驱动的真实启动入口；Mac 上只完成了离线验证，
-> 未执行云调用、ROS、机器人动作或 HIL。除非 `.env` 显式设置
-> `PHI_AUTONOMY_ENABLED=1`，原真实 ROS 启动路径不会自动切换。
+A ROS2 Humble-based control system for box-handling tasks with the G1 humanoid
+robot. It provides a **main page** for nine-cell grid selection and live progress,
+plus a **debug console** for step-by-step debugging and automatic execution.
+ROS2 services and topics connect TaskManger to Gateway (C++ motion control),
+Navigation (path planning), and FoundationPose (6DoF pose estimation) to coordinate
+**walking, lifting a box, carrying it, and placing it down**.
 
 ## Demo
 
 https://github.com/user-attachments/assets/59934c96-b3b6-48cb-a8c2-f17d752b9a03
 
-## 系统架构
+## System Architecture
 
-```
-┌─ 浏览器 ──────────────────────────────────────────────────────┐
-│                                                                │
-│  主页 (index.html :4173)          debug 控制台 (debug.html)     │
-│  ├─ 九宫格画路径                    ├─ 步骤列表                   │
-│  ├─ 点 RUN → POST /load 加载计划   ├─ 自动执行 (FP select_target)│
-│  └─ SSE /stream 实时进度           └─ 手动模式                   │
-│                         │                                      │
-└─────────────────────────│──────────────────────────────────────┘
-                          │ HTTP + SSE
-                          ▼
-┌─ TaskManger (Flask :5000) ────────────────────────────────────┐
-│  phi_robot/                                                    │
-│  ├─ api_server.py          REST API + SSE 端点                 │
-│  ├─ step_debug.py          StepDebugController (分步调试引擎)   │
-│  ├─ mission_planner.py     任务规划 (九宫格 → 执行步骤)         │
-│  ├─ robot_state.py         SafetyStateMachine (9 状态安全机)    │
-│  ├─ service_manager.py     远程服务管理 (systemd over SSH)      │
-│  ├─ robot_profile.py       多机器人档案管理                      │
-│  └─ adapters/ros_acceptance.py   ROS2 适配器                    │
-└──────────────┬─────────────────────────────────────────────────┘
+```text
+Browser
+├─ Main page (index.html :4173)
+│  ├─ Plan a route on the nine-cell grid
+│  ├─ RUN → POST /load to load the plan
+│  └─ Live progress via SSE /stream
+└─ Debug console (debug.html)
+   ├─ Step list
+   ├─ Automatic execution (FP select_target)
+   └─ Manual controls
+               │ HTTP + SSE
+               ▼
+TaskManger (Flask :5000)
+└─ phi_robot/
+   ├─ api_server.py              REST API + SSE endpoints
+   ├─ step_debug.py              StepDebugController (step execution engine)
+   ├─ mission_planner.py         Task planning (grid → execution steps)
+   ├─ robot_state.py             SafetyStateMachine (9 states)
+   ├─ service_manager.py         Remote service management (systemd over SSH)
+   ├─ robot_profile.py           Multi-robot profiles
+   └─ adapters/ros_acceptance.py ROS2 adapter
                │ ROS2 Service / Topic / Action
                ▼
-┌─ ROS2 中间层 ─────────────────────────────────────────────────┐
-│  goal_bridge       /start_navigation → /goal_pose              │
-│  ZMQ Bridge        CycloneDDS(robot) ↔ Fast-DDS(workstation)   │
-│  FoundationPose    /foundationpose/select_target                │
-└──────────────┬─────────────────────────────────────────────────┘
+ROS2 Integration Layer
+├─ goal_bridge       /start_navigation → /goal_pose
+├─ ZMQ Bridge        CycloneDDS (robot) ↔ Fast-DDS (workstation)
+└─ FoundationPose    /foundationpose/select_target
                │
                ▼
-┌─ G1 机器人 (Orin) ────────────────────────────────────────────┐
-│  Gateway (C++)      运动控制 (lift/lay_down/stand/replay)       │
-│  SONIC              全身控制策略                                │
-│  FAST-LIO            激光惯性里程计                              │
-│  Nav2                路径规划                                    │
-└────────────────────────────────────────────────────────────────┘
+G1 Robot (Orin)
+├─ Gateway (C++)     Motion control (lift/lay_down/stand/replay)
+├─ SONIC             Whole-body control policy
+├─ FAST-LIO          LiDAR-inertial odometry
+└─ Nav2              Path planning
 ```
 
-**关键数据流**：
+**Key data flows**:
 
-| 方向 | 路径 | 说明 |
+| Flow | Path | Notes |
 |---|---|---|
-| 导航目标 | TaskManger → `/start_navigation` → goal_bridge → `/goal_pose` → Nav2 | |
-| 导航到达 | Nav2 → `/nav_reached` → ZMQ Bridge → TaskManger | |
-| 运动控制 | TaskManger → Gateway Services (`/set_lift`, `/set_lay_down`, 等) | |
-| 位姿估计 | FoundationPose `/foundationpose/pose_results` → TaskManger | pelvis 帧 |
-| 模式切换 | TaskManger → `/locomotion_mode` (Topic) → Gateway | 1=行走, 2=搬运 |
-| 暂停导航 | TaskManger → `/nav_pause` (Topic) → ZMQ Bridge → Nav2 | |
-| 掉箱检测 | FoundationPose `/vision/drop_detector_enable` → Gateway | |
+| Navigation goal | TaskManger → `/start_navigation` → goal_bridge → `/goal_pose` → Nav2 | |
+| Arrival confirmation | Nav2 → `/nav_reached` → ZMQ Bridge → TaskManger | |
+| Motion control | TaskManger → Gateway services (`/set_lift`, `/set_lay_down`, etc.) | |
+| Pose estimation | FoundationPose `/foundationpose/pose_results` → TaskManger | pelvis frame |
+| Mode switching | TaskManger → `/locomotion_mode` (Topic) → Gateway | 1 = walking, 2 = carrying |
+| Navigation pause | TaskManger → `/nav_pause` (Topic) → ZMQ Bridge → Nav2 | |
+| Drop detection | FoundationPose `/vision/drop_detector_enable` → Gateway | |
 
-## 目录结构
+## Repository Structure
 
-```
+```text
 TaskManger/
-├── phi_robot/                          # 后端 Python 包
+├── phi_robot/                          # Backend Python package
 │   ├── adapters/
-│   │   └── ros_acceptance.py           # ROS2 适配器 (Gateway/Nav/FP 联调核心)
-│   ├── api_server.py                   # Flask API 服务 (REST + SSE)
-│   ├── step_debug.py                   # 分步调试控制器 (StepDebugController)
-│   ├── dev_console.py                  # 调试控制台控制器
-│   ├── mission_planner.py              # 任务规划器 (九宫格坐标 → 执行步骤)
-│   ├── mission_runner.py               # 任务执行引擎
-│   ├── mission_service.py              # 任务持久化
-│   ├── robot_state.py                  # SafetyStateMachine (9 状态 + 迁移白名单)
-│   ├── robot_profile.py                # 多机器人档案管理
-│   ├── service_manager.py              # 远程 systemd 服务管理
-│   ├── service_registry.json           # 服务注册表 (工作站 + Orin)
-│   ├── robots.json                     # 机器人 IP/Domain 配置
-│   ├── scene_coords.json               # 场地 Nav2 map 坐标配置
-│   ├── audit.py                        # 操作审计日志
-│   ├── recovery_diag.py                # 恢复诊断事件工厂
-│   └── models.py                       # 数据模型
-├── phi_robot_fronted/                  # 前端 React 18 + Vite 5
-│   ├── index.html                      # 主页入口
-│   ├── debug.html                      # 调试控制台入口
+│   │   └── ros_acceptance.py           # ROS2 adapter for Gateway/Nav/FP integration
+│   ├── api_server.py                   # Flask API server (REST + SSE)
+│   ├── step_debug.py                   # Step-by-step controller (StepDebugController)
+│   ├── dev_console.py                  # Debug console controller
+│   ├── mission_planner.py              # Task planner (grid coordinates → steps)
+│   ├── mission_runner.py               # Task execution engine
+│   ├── mission_service.py              # Task persistence
+│   ├── robot_state.py                  # SafetyStateMachine (9 states + allowed transitions)
+│   ├── robot_profile.py                # Multi-robot profile management
+│   ├── service_manager.py              # Remote systemd service management
+│   ├── service_registry.json           # Service registry (workstation + Orin)
+│   ├── robots.json                     # Robot IP/domain configuration
+│   ├── scene_coords.json               # Scene coordinates in the Nav2 map frame
+│   ├── audit.py                        # Operation audit logs
+│   ├── recovery_diag.py                # Recovery diagnostic event factory
+│   └── models.py                       # Data models
+├── phi_robot_fronted/                  # React 18 + Vite 5 frontend
+│   ├── index.html                      # Main page entry point
+│   ├── debug.html                      # Debug console entry point
 │   └── src/
-│       ├── App.jsx                     # 主页: 九宫格 + SSE 进度
-│       ├── debug-main.jsx              # 调试页入口
-│       ├── DeveloperConsole.jsx        # 调试控制台
-│       ├── StepDebugPanel.jsx          # 分步调试面板
-│       ├── LockBoard2D.jsx             # 九宫格画布
-│       ├── UnifiedConsole.jsx          # 统一控制台
-│       ├── StepDetailPanel.jsx         # 步骤详情 + 终端输出
-│       └── index.css                   # lunar 主题样式
-├── bridge/                             # 桥接层代码
+│       ├── App.jsx                     # Main page: grid + SSE progress
+│       ├── debug-main.jsx              # Debug page entry point
+│       ├── DeveloperConsole.jsx        # Debug console
+│       ├── StepDebugPanel.jsx          # Step-by-step debug panel
+│       ├── LockBoard2D.jsx             # Nine-cell grid canvas
+│       ├── UnifiedConsole.jsx          # Unified console
+│       ├── StepDetailPanel.jsx         # Step details + terminal output
+│       └── index.css                   # Lunar theme styles
+├── bridge/                             # Integration bridges
 │   ├── workstation/
-│   │   └── goal_bridge.py              # /start_navigation → /goal_pose (等 /navigation_complete)
+│   │   └── goal_bridge.py              # /start_navigation → /goal_pose (waits for /navigation_complete)
 │   └── orin/
-│       ├── goal_bridge.py              # Orin 侧 goal 桥接
-│       ├── action_bridge.py            # Action 桥接
-│       └── zmq_bridge.py               # ZMQ 跨 DDS 桥接
-├── systemd/                            # systemd 服务单元文件
-│   ├── workstation/                    #   工作站侧 (部署到 ~/.config/systemd/user/)
-│   └── orin/                           #   Orin 侧 (部署到机器人 ~/.config/systemd/user/)
-├── scripts/                            # 一键启动脚本
+│       ├── goal_bridge.py              # Orin-side goal bridge
+│       ├── action_bridge.py            # Action bridge
+│       └── zmq_bridge.py               # ZMQ bridge between DDS domains
+├── systemd/                            # systemd service unit files
+│   ├── workstation/                    # Deploy to ~/.config/systemd/user/ on the workstation
+│   └── orin/                           # Deploy to ~/.config/systemd/user/ on the robot
+├── scripts/                            # Startup scripts
 │   ├── start_taskmanger.sh
 │   └── start_foundationpose.sh
-├── robot_interfaces/                   # ExecuteTrajectory 服务定义
-├── phi_robot_interfaces/               # phi_robot 自定义接口
-├── run_phi_robot_api.py                # 后端启动入口
-├── run_ros_acceptance.sh               # ROS2 联调启动脚本
-└── requirements.txt                    # Python 依赖
+├── robot_interfaces/                   # ExecuteTrajectory service definition
+├── phi_robot_interfaces/               # Custom phi_robot interfaces
+├── run_phi_robot_api.py                # Backend entry point
+├── run_ros_acceptance.sh               # ROS2 integration startup script
+└── requirements.txt                    # Python dependencies
 ```
 
-## 环境要求
+## Requirements
 
-| 组件 | 版本 | 备注 |
+| Component | Version | Notes |
 |------|------|------|
-| OS | Ubuntu 22.04 | 工作站 + Orin |
+| OS | Ubuntu 22.04 | Workstation + Orin |
 | ROS2 | Humble | `/opt/ros/humble` |
-| Python | 3.10 | 系统或 conda |
-| Node.js | ≥ 18 | 前端 |
-| DDS | Fast-DDS | workstation 侧 |
-| DDS | CycloneDDS | Orin 机器人侧 |
-| conda | miniconda3 | FoundationPose 环境 |
+| Python | 3.10 | System Python or conda |
+| Node.js | ≥ 18 | Frontend |
+| DDS | Fast-DDS | Workstation |
+| DDS | CycloneDDS | Orin robot |
+| conda | miniconda3 | FoundationPose environment |
 
-### Python 依赖
+### Python Dependencies
 
-```
+```text
 flask>=3.0,<4.0
 flask-cors>=4.0,<5.0
 jsonschema>=4.23,<5.0
 ```
 
-`rclpy`、`std_msgs`、`sensor_msgs` 为 ROS2 Humble 自带。
+`rclpy`, `std_msgs`, and `sensor_msgs` are provided by ROS2 Humble.
 
-建议用仓库内的 `environment.yml` 创建隔离的开发环境：
+Use the repository's `environment.yml` to create an isolated development environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate AgenticRobot
-python --version  # 必须为 3.10.x
+python --version  # Must be 3.10.x
 ```
 
-`AgenticRobot` 包含后端与离线测试依赖；ROS Python 包仍由 Ubuntu 22.04
-上的 ROS2 Humble 提供。正式离线 Gate 需在目标 Ubuntu 主机上 source
-Humble 后执行 `TASKMANAGER_PYTHON="$CONDA_PREFIX/bin/python" ./scripts/check_offline.sh`。
+`AgenticRobot` includes the backend and offline test dependencies. ROS Python
+packages are supplied by ROS2 Humble on Ubuntu 22.04. For the formal offline
+acceptance gate, source Humble on the target Ubuntu host, then run
+`TASKMANAGER_PYTHON="$CONDA_PREFIX/bin/python" ./scripts/check_offline.sh`.
 
-### 前端依赖
+### Frontend Dependencies
 
 React 18 + Vite 5 + Ant Design 5
 
-## 配置
+## Configuration
 
-### Gemini Robotics-ER 2（自主运行时，显式启用）
+### Gemini Robotics-ER 2 (Autonomous Runtime, Explicit Opt-in)
 
-直接编辑项目根目录的 `.env`；它已被 Git 忽略，运行时会自动读取：
+Edit `.env` in the project root. It is ignored by Git and loaded automatically by
+the runtime:
 
 ```dotenv
-GEMINI_API_KEY=使用轮换后的新密钥
+GEMINI_API_KEY=your_rotated_api_key
 GEMINI_ROBOTICS_MODEL=gemini-robotics-er-1.6-preview
 GEMINI_API_MODE=generate_content
 PHI_AUTONOMY_ENABLED=1
@@ -172,30 +170,34 @@ TASKMANAGER_PYTHON=/home/hairo/miniconda3/envs/AgenticRobot/bin/python
 PHI_OPERATOR_CIDRS=127.0.0.0/8,192.168.50.0/24
 ```
 
-模型和 API 模式已有默认值；当前公开 Robotics-ER 模型以 Google 官方模型页为准，
-若账号提供了其他专用模型 ID，只需覆盖这一行。在目标主机上额外打开
-`PHI_AUTONOMY_ENABLED=1` 即可让现有 systemd 启动脚本选择自主入口。普通
-`gemini-flash-latest` 不是 Robotics-ER。创建 `GeminiAutonomyRuntime`
-本身不会发起网络或机器人调用。若从另一台电脑打开控制台，把该电脑所在的可信
-管理网段加入 `PHI_OPERATOR_CIDRS`，否则监控可用但暂停/急停按钮会被拒绝。
+The model and API mode have defaults. Refer to Google's official model
+documentation for Robotics-ER availability, and override the model ID if your
+account provides a different one. Set `PHI_AUTONOMY_ENABLED=1` on the target host
+to select the autonomous entry point through the existing systemd startup
+scripts. The general-purpose `gemini-flash-latest` model is not Robotics-ER.
+Constructing `GeminiAutonomyRuntime` alone does not make network or robot calls.
+When opening the console from another computer, add its trusted management
+subnet to `PHI_OPERATOR_CIDRS`; otherwise, monitoring remains available, but
+pause and emergency-stop requests will be rejected.
 
-### 1. 机器人配置 (`phi_robot/robots.json`)
+### 1. Robot Configuration (`phi_robot/robots.json`)
 
-多机器人档案的**唯一事实来源**。`switch_robot.sh` 读取此文件生成 `active_robot.env`。
+The **single source of truth** for robot profiles. `switch_robot.sh` reads this
+file to generate `active_robot.env`.
 
 ```json
 {
   "active": "A",
   "robots": {
     "A": {
-      "label": "机器人A",
+      "label": "Robot A",
       "ip": "192.168.3.168",
       "domain_id": 66,
       "camera_host": "192.168.3.168",
       "orin_host": "unitree@192.168.3.168"
     },
     "B": {
-      "label": "机器人B",
+      "label": "Robot B",
       "ip": "192.168.3.215",
       "domain_id": 5,
       "camera_host": "192.168.3.215",
@@ -205,18 +207,18 @@ PHI_OPERATOR_CIDRS=127.0.0.0/8,192.168.50.0/24
 }
 ```
 
-**字段说明**：
+**Fields**:
 
-| 字段 | 说明 |
+| Field | Description |
 |------|------|
-| `ip` | 机器人 IP |
-| `domain_id` | ROS2 DDS domain（每台机器人独立 domain 防止干扰） |
-| `camera_host` | ZMQ 相机服务器 IP |
-| `orin_host` | SSH 连接串（用于 service_manager 远程管理） |
+| `ip` | Robot IP address |
+| `domain_id` | ROS2 DDS domain; use a separate domain for each robot to avoid interference |
+| `camera_host` | ZMQ camera server IP address |
+| `orin_host` | SSH connection string for remote management by `service_manager` |
 
-### 2. 场景坐标 (`phi_robot/scene_coords.json`)
+### 2. Scene Coordinates (`phi_robot/scene_coords.json`)
 
-Nav2 map 坐标系下的 9 目标点 + 1 物料点配置。
+Configure nine destination cells and one stock point in the Nav2 map frame.
 
 ```json
 {
@@ -238,13 +240,14 @@ Nav2 map 坐标系下的 9 目标点 + 1 物料点配置。
 }
 ```
 
-改坐标只需编辑此文件 + 重启 TaskManger，前端从 `/api/scene_coords` 自动拉取。
+To update the coordinates, edit this file and restart TaskManger. The frontend
+loads them automatically from `/api/scene_coords`.
 
-### 3. `active_robot.env`（自动生成）
+### 3. `active_robot.env` (Generated Automatically)
 
-由 `switch_robot.sh` 从 `robots.json` 生成，**不要手动编辑**：
+Generated by `switch_robot.sh` from `robots.json`. **Do not edit it manually**:
 
-```
+```dotenv
 ROS_DOMAIN_ID=66
 APP_DOMAIN=66
 WAIC_ROBOT_ID=A
@@ -254,43 +257,51 @@ FP_CAMERA_HOST=192.168.3.168
 WAIC_ORIN_HOST=unitree@192.168.3.168
 ```
 
-所有 systemd 服务通过 `EnvironmentFile` 读取此文件来获取 domain 和目标机器人。
+All systemd services load this file through `EnvironmentFile` to select the DDS
+domain and target robot.
 
-### 迁移到 WAIC 主机（只改配置）
+### Deploying to a WAIC Host (Configuration Only)
 
-主机侧只维护以下三处，不需要修改 Python/前端代码：
+Maintain these three configuration files on the host; no Python or frontend code
+changes are required:
 
-1. 根目录 `.env`：API key、`PHI_AUTONOMY_ENABLED=1` 和 TaskManger Python 路径。
-2. `phi_robot/robots.json`：机器人 IP、ROS domain、相机和 Orin 地址。
-3. `phi_robot/scene_coords.json`：当前地图的九宫格坐标。
+1. Root `.env`: API key, `PHI_AUTONOMY_ENABLED=1`, and the TaskManger Python path.
+2. `phi_robot/robots.json`: robot IP addresses, ROS domains, camera hosts, and Orin hosts.
+3. `phi_robot/scene_coords.json`: nine-cell grid coordinates for the current map.
 
-代码同步和前端构建完成后，先执行不接触 ROS/云/机器人的配置检查：
+After syncing the code and building the frontend, run a configuration check that
+does not contact ROS, cloud services, or the robot:
 
 ```bash
 cd /home/hairo/waic/TaskManger
 ${TASKMANAGER_PYTHON} run_autonomy_api.py --check-config
 ```
 
-输出 `"ok": true` 后，现有 `waic-taskmanger.service` 仍调用
-`scripts/start_taskmanger.sh`；脚本会读取同一个 `.env` 和
-`active_robot.env`，并在自主模式下由 Flask 同端口提供构建好的前端，因此无需
-再长期运行 Vite 开发服务器。若主机路径、ROS 服务名与 WAIC 当前约定一致，部署
-时不需要添加其他配置；不同路径或服务名可用 `.env` 中的 `PHI_*` 覆盖。
+Once the check returns `"ok": true`, the existing `waic-taskmanger.service`
+continues to invoke `scripts/start_taskmanger.sh`. The script reads the same
+`.env` and `active_robot.env`. In autonomous mode, Flask serves the built frontend
+on the same port, so a long-running Vite development server is unnecessary. No
+additional configuration is needed when host paths and ROS service names match
+the WAIC setup. Override different paths or service names with `PHI_*` variables
+in `.env`.
 
-真实启用前仍需按顺序完成静态接口、单动作、整任务和注入掉箱 HIL。停止确认使用
-现有 `/nav_pause` 加连续新鲜 `/odom` 低速证据；证据不足时会停在人工介入状态，
-不会把发布成功当成机器人已经停稳。
+Before enabling real-robot operation, complete static interface checks, individual
+action trials, full-mission trials, and injected-drop hardware-in-the-loop (HIL)
+tests in that order. Stop confirmation uses `/nav_pause` together with consecutive,
+fresh `/odom` samples showing low velocity. Insufficient evidence leaves the
+system awaiting operator intervention; successful publication alone does not
+prove that the robot has stopped.
 
-## 快速开始
+## Quick Start
 
-### 1. 克隆
+### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/PHI-WAIC/TaskManger.git
+git clone https://github.com/HenryLiu0405/TaskManger.git
 cd TaskManger
 ```
 
-### 2. 构建 ROS2 接口包
+### 2. Build the ROS2 Interface Packages
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -298,27 +309,27 @@ colcon build --symlink-install --packages-select robot_interfaces phi_robot_inte
 source install/setup.bash
 ```
 
-### 3. 安装依赖
+### 3. Install Dependencies
 
 ```bash
-# Python 虚拟环境
+# Python virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 前端
+# Frontend
 cd phi_robot_fronted
 npm install
-npm run build        # 生产构建到 dist/
+npm run build        # Production build in dist/
 ```
 
-### 4. 配置机器人
+### 4. Configure the Robot
 
 ```bash
-# 编辑 robots.json 填入你的机器人 IP 和 domain_id
+# Set the robot IP address and domain_id in robots.json
 vim phi_robot/robots.json
 
-# 生成 active_robot.env
+# Generate active_robot.env
 python3 -c "
 import sys; sys.path.insert(0, '.')
 from phi_robot import robot_profile
@@ -326,21 +337,21 @@ robot_profile.write_env_file(robot_profile.get_active())
 "
 ```
 
-### 5. 启动
+### 5. Start the System
 
-**方式 A：systemd（生产推荐）**
+**Option A: systemd (recommended for deployment)**
 
 ```bash
 cp systemd/workstation/*.service ~/.config/systemd/user/
-# 按实际环境修改 .service 文件中的路径
+# Update paths in the .service files for your environment
 systemctl --user daemon-reload
 systemctl --user start waic-taskmanger
 ```
 
-**方式 B：手动启动**
+**Option B: manual startup**
 
 ```bash
-# 终端 1: 后端
+# Terminal 1: backend
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 source /home/hairo/waic/active_robot.env
@@ -348,108 +359,118 @@ source .venv/bin/activate
 python3 run_phi_robot_api.py --port 5000 --acceptance ros \
   --path-plan-service /start_navigation
 
-# 终端 2: 前端
+# Terminal 2: frontend
 cd phi_robot_fronted
 npm run dev
 ```
 
-### 6. 访问
+### 6. Open the Web Interface
 
-| 页面 | 地址 | 用途 |
+| Page | URL | Purpose |
 |------|------|------|
-| 主页 | `http://localhost:4173/` | 九宫格画路径 → 加载计划 |
-| 调试控制台 | `http://localhost:4173/debug.html` | 分步调试 / 自动执行 (FP select_target) |
+| Main page | `http://localhost:4173/` | Draw a route on the grid and load the plan |
+| Debug console | `http://localhost:4173/debug.html` | Step-by-step debugging / automatic execution (FP select_target) |
 
-## 双界面工作流
+## Dual-Interface Workflow
 
+```text
+Main page (index.html)                 Debug console (debug.html)
+        │                                      │
+Draw a grid route and click RUN        Inspect the loaded plan
+        │                                      │
+POST /api/dev/step_debug/load          Click automatic execution
+        │                                      │
+Plan loaded for display               StepDebugController._run_auto()
+        │                             (select_target + fail-stop)
+        │                                      │
+        ◀──────── Live progress via SSE /stream ┘
+        │
+UnifiedConsole: progress markers
+StepDetailPanel: step status
 ```
-┌─ 主页 (index.html) ───────────┐   ┌─ debug.html ────────────────┐
-│                                │   │                              │
-│  用户画九宫格 → 点 RUN          │   │  操作员看到已加载的计划        │
-│       ↓                        │   │       ↓                      │
-│  POST /api/dev/step_debug/load │   │  点击"自动执行"               │
-│  计划已加载（只显示，不执行）    │   │       ↓                      │
-│       ↓                        │   │  StepDebugController._run_auto│
-│  ← SSE /stream 实时推送进度 ───│──│  (select_target + fail-stop)   │
-│  UnifiedConsole 显示进度点      │   │                              │
-│  StepDetailPanel 步骤状态      │   │                              │
-└────────────────────────────────┘   └──────────────────────────────┘
-```
 
-**关键设计**：主页 RUN 和 debug 自动执行走同一引擎（`StepDebugController._run_auto()`），包含 FP `select_target` 自动单目标锁定。主页通过 SSE 实时同步步骤状态，不需要轮询。
+**Key design**: the main-page RUN workflow and debug-console automatic execution
+share the same execution engine, `StepDebugController._run_auto()`, including
+automatic single-object locking through FP `select_target`. The main page
+receives live step updates through SSE without polling.
 
-## 机器人切换
+## Switching Robots
 
 ```bash
-# 切换到机器人 B
+# Switch to robot B
 /home/hairo/waic/switch_robot.sh B
 
-# 查看当前受控机器人
+# Check the active robot
 curl http://localhost:5000/api/robot/active
 ```
 
-`switch_robot.sh` 会：
-1. 从 `robots.json` 读取目标机器人 profile
-2. 重新生成 `active_robot.env`
-3. 重启 `waic-navigation`、`waic-goal-bridge`、`waic-foundationpose`
-4. 最后重启 `waic-taskmanger`（新 domain 生效）
+`switch_robot.sh` performs the following steps:
 
-> **硬约束**：ROS_DOMAIN_ID 在进程启动时固定，切换机器人 = 切换 domain = 必须重启整套服务。
+1. Read the target robot profile from `robots.json`.
+2. Regenerate `active_robot.env`.
+3. Restart `waic-navigation`, `waic-goal-bridge`, and `waic-foundationpose`.
+4. Restart `waic-taskmanger` last to apply the new domain.
 
-## ROS2 接口
+> **Required**: `ROS_DOMAIN_ID` is fixed when a process starts. Switching robots
+> changes the domain and requires restarting the full service stack.
 
-### Service（TaskManger 调用）
+## ROS2 Interfaces
 
-| 服务 | 类型 | 说明 |
+### Services Called by TaskManger
+
+| Service | Type | Description |
 |------|------|------|
-| `/start_navigation` | `ExecuteTrajectory` | 路径规划导航 (→ goal_bridge → /goal_pose) |
-| `/submit_carry_task` | `SubmitCarryTask` | 提交搬起任务 (单物体位姿 → Gateway) |
-| `/set_lay_down` | `SetBool` | 放下箱子 |
-| `/set_stand` | `Trigger` | 机器人站立 |
-| `/notify_goal_reached` | `SetBool` | 通知 Gateway 已到达 (carry_walking 后进入 goal_reached_locked) |
-| `/foundationpose/select_target` | `SelectTarget` | FP 单目标锁定 (MODE_TARGET/MODE_DROPPED) |
-| `/foundationpose/activate` | `Activate` | 激活/停用 FP 跟踪 |
-| `/foundationpose/reset` | `Reset` | 重置 FP tracker |
+| `/start_navigation` | `ExecuteTrajectory` | Path-planning navigation (→ goal_bridge → /goal_pose) |
+| `/submit_carry_task` | `SubmitCarryTask` | Submit a lifting task (single-object pose → Gateway) |
+| `/set_lay_down` | `SetBool` | Place the box down |
+| `/set_stand` | `Trigger` | Move the robot to a standing posture |
+| `/notify_goal_reached` | `SetBool` | Notify Gateway of arrival (transition from carry_walking to goal_reached_locked) |
+| `/foundationpose/select_target` | `SelectTarget` | FP single-object locking (MODE_TARGET/MODE_DROPPED) |
+| `/foundationpose/activate` | `Activate` | Enable/disable FP tracking |
+| `/foundationpose/reset` | `Reset` | Reset the FP tracker |
 
-### Topic（TaskManger 发布/订阅）
+### Topics Published or Subscribed to by TaskManger
 
-| 话题 | 类型 | 方向 | 说明 |
+| Topic | Type | Direction | Description |
 |------|------|------|------|
-| `/locomotion_mode` | `Int32` | 发布 | 运动模式: `1`=正常行走, `2`=携带行走。0.4s 间隔持续发布 |
-| `/nav_pause` | `Bool` | 发布 | 暂停/恢复导航 |
-| `/nav_reached` | `Bool` | 订阅 | 导航到达确认 (Nav2 → ZMQ Bridge → TaskManger) |
-| `/foundationpose/pose_results` | `PoseEstimateArray` | 订阅 | FP 位姿估计结果 (pelvis 帧) |
-| `/fp_state` | `String` | 订阅 | FP 跟踪状态 JSON |
-| `/odom` | `Odometry` | 订阅 | 里程计 (TF 已废弃，只用 odom) |
-| `/G1Env/env_state_act` | `ByteMultiArray` | 订阅 | SONIC 环境状态 (含 waist joint angles，仅 FP 使用) |
+| `/locomotion_mode` | `Int32` | Publish | Motion mode: `1` = normal walking, `2` = carrying; published every 0.4 s |
+| `/nav_pause` | `Bool` | Publish | Pause/resume navigation |
+| `/nav_reached` | `Bool` | Subscribe | Navigation arrival confirmation (Nav2 → ZMQ Bridge → TaskManger) |
+| `/foundationpose/pose_results` | `PoseEstimateArray` | Subscribe | FP pose estimates in the pelvis frame |
+| `/fp_state` | `String` | Subscribe | FP tracking state as JSON |
+| `/odom` | `Odometry` | Subscribe | Odometry; uses odom rather than the deprecated TF path |
+| `/G1Env/env_state_act` | `ByteMultiArray` | Subscribe | SONIC environment state, including waist joint angles; used only by FP |
 
-### SelectTarget 服务详解
+### SelectTarget Service Details
 
-```
+```text
 /foundationpose/select_target
   Request:
-    mode: 0 (MODE_TARGET: 取箱) | 1 (MODE_DROPPED: 掉箱检测)
-    select: true=进入模式, false=退出
-    material_points_xy: [x1, y1, x2, y2, ...]  # 所有物料点
-    target_points_xy: [x1, y1, x2, y2, ...]     # 所有目标点
-    pick_x, pick_y: 当前要拿取的物料点坐标
-    point_tolerance: 容差 (默认 0.3m)
+    mode: 0 (MODE_TARGET: pick) | 1 (MODE_DROPPED: drop detection)
+    select: true=enter mode, false=exit mode
+    material_points_xy: [x1, y1, x2, y2, ...]  # All stock points
+    target_points_xy: [x1, y1, x2, y2, ...]    # All destination points
+    pick_x, pick_y: Coordinates of the stock point to pick from
+    point_tolerance: Position tolerance (default: 0.3 m)
 
   Response:
     success: bool
-    matched_object_id: int32   # 匹配到的物体 ID, -1=未匹配
-    box_world_xy: [x1, y1, ...]  # 视野中所有箱子世界坐标
-    box_object_ids: [id1, ...]  # 对应箱子 ID
+    matched_object_id: int32    # Matched object ID; -1 means no match
+    box_world_xy: [x1, y1, ...] # World coordinates of all visible boxes
+    box_object_ids: [id1, ...]  # Corresponding box IDs
 ```
 
-**自动执行流程**：pick 步前自动 `select_target(select=True, MODE_TARGET)` 锁定距离取料点最近的箱子；pick 完成后自动 `select_target(select=False)` 退出并重新启用掉箱检测。
+**Automatic execution**: before the pick step,
+`select_target(select=True, MODE_TARGET)` locks onto the box nearest the stock
+point. After picking, `select_target(select=False)` exits target mode and
+re-enables drop detection.
 
-## DDS & ZMQ Bridge 拓扑
+## DDS & ZMQ Bridge Topology
 
-```
-机器人 Orin                        工作站
-CycloneDDS domain 0               Fast-DDS domain 66/5
-                                  
+```text
+Robot Orin                      Workstation
+CycloneDDS domain 0              Fast-DDS domain 66/5
+
   /goal_pose    ──ZMQ:5561──▶     /goal_pose
   /cmd_vel      ──ZMQ:5562──▶     /cmd_vel
   /tf           ──ZMQ:5564──▶     /tf
@@ -458,88 +479,90 @@ CycloneDDS domain 0               Fast-DDS domain 66/5
   /nav_reached  ──ZMQ:5567──▶     /nav_reached
 ```
 
-12 个 worker（6 对 sub/pub）在 Orin `/home/unitree/waic_bridge/zmq_bridge.py` 上运行。
+Twelve workers (six subscriber/publisher pairs) run on the Orin through
+`/home/unitree/waic_bridge/zmq_bridge.py`.
 
-## API 端点
+## API Endpoints
 
-### 任务 & 状态
+### Tasks & Status
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/snapshot` | 系统快照 |
-| GET | `/api/robot/state` | SafetyStateMachine 当前状态 |
+| GET | `/api/health` | Health check |
+| GET | `/api/snapshot` | System snapshot |
+| GET | `/api/robot/state` | Current SafetyStateMachine state |
 
-### 分步调试 (StepDebugController)
+### Step-by-Step Debugging (StepDebugController)
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| POST | `/api/dev/step_debug/load` | 加载计划 (主页 RUN 按钮调用) |
-| POST | `/api/dev/step_debug/auto_run` | 自动执行 (debug 自动执行按钮) |
-| POST | `/api/dev/step_debug/pause` | 暂停 |
-| POST | `/api/dev/step_debug/resume` | 继续 |
-| POST | `/api/dev/step_debug/stop` | 终止 |
-| POST | `/api/dev/step_debug/select_target_toggle` | 手动切换 FP 单目标模式 |
-| POST | `/api/dev/step_debug/drop_check` | 手动掉箱检测 |
-| GET | `/api/dev/step_debug/stream` | SSE 事件流 (主页实时进度) |
-| GET | `/api/dev/step_debug/state` | 当前分步调试状态 |
+| POST | `/api/dev/step_debug/load` | Load a plan (main-page RUN button) |
+| POST | `/api/dev/step_debug/auto_run` | Start automatic execution (debug-console execution button) |
+| POST | `/api/dev/step_debug/pause` | Pause execution |
+| POST | `/api/dev/step_debug/resume` | Resume execution |
+| POST | `/api/dev/step_debug/stop` | Stop execution |
+| POST | `/api/dev/step_debug/select_target_toggle` | Manually toggle FP single-target mode |
+| POST | `/api/dev/step_debug/drop_check` | Run a manual drop check |
+| GET | `/api/dev/step_debug/stream` | SSE event stream for live main-page progress |
+| GET | `/api/dev/step_debug/state` | Current step-debug state |
 
-### 机器人管理
+### Robot Management
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| GET | `/api/robot/active` | 当前受控机器人 + domain 同步状态 |
-| GET | `/api/robot/list` | 所有可选机器人 |
-| GET | `/api/scene_coords` | 场地坐标配置 (前端动态渲染用) |
+| GET | `/api/robot/active` | Active robot and domain synchronization status |
+| GET | `/api/robot/list` | All available robots |
+| GET | `/api/scene_coords` | Scene coordinates for dynamic frontend rendering |
 
-### 服务管理
+### Service Management
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |------|------|------|
-| GET | `/api/services` | 列出所有服务状态 |
-| POST | `/api/services/<id>/start` | 启动服务 |
-| POST | `/api/services/<id>/stop` | 停止服务 |
+| GET | `/api/services` | List all service statuses |
+| POST | `/api/services/<id>/start` | Start a service |
+| POST | `/api/services/<id>/stop` | Stop a service |
 
 ## SafetyStateMachine
 
-9 状态 + 迁移白名单 + 黑名单双重校验，防止非法操作。
+Nine states, an allowed-transition list, and per-action blocked states prevent
+invalid operations.
 
-| 状态 | 说明 |
+| State | Description |
 |------|------|
-| `IDLE` | 空闲，未就绪 |
-| `STANDING` | 已站立，可移动 |
-| `MOVING` | 行走中 |
-| `ARRIVED` | 已到达目标位置 |
-| `PICKING` | 搬起执行中 |
-| `HOLDING` | 持有箱子 |
-| `PLACING` | 放下执行中 |
-| `EMERGENCY` | 急停 |
-| `ERROR` | 故障 |
+| `IDLE` | Idle, not ready |
+| `STANDING` | Standing and ready to move |
+| `MOVING` | Walking |
+| `ARRIVED` | Arrived at the destination |
+| `PICKING` | Lifting in progress |
+| `HOLDING` | Holding a box |
+| `PLACING` | Placement in progress |
+| `EMERGENCY` | Emergency stop |
+| `ERROR` | Fault |
 
-**黑名单**：
+**Blocked actions**:
 
-| 操作 | 禁用状态 |
+| Action | Blocked States |
 |------|------|
 | walk | PICKING, PLACING, EMERGENCY, ERROR |
 | pick | IDLE, MOVING, PICKING, HOLDING, PLACING, EMERGENCY, ERROR |
 | place | IDLE, STANDING, MOVING, PICKING, EMERGENCY, ERROR |
 
-## 部署
+## Deployment
 
-### systemd 服务一览
+### systemd Services
 
-**工作站**：
+**Workstation**:
 
-| 服务 | systemd 单元 |
+| Service | systemd Unit |
 |------|-------------|
 | TaskManger | `waic-taskmanger` |
-| Navigation（仿真） | `waic-navigation` |
+| Navigation (simulation) | `waic-navigation` |
 | goal_bridge | `waic-goal-bridge` |
 | FoundationPose | `waic-foundationpose` |
 
-**Orin 真机**：
+**Robot Orin**:
 
-| 服务 | systemd 单元 |
+| Service | systemd Unit |
 |------|-------------|
 | Gateway | `waic-gateway@<domain>` |
 | SONIC | `waic-sonic-real@<domain>` |
@@ -547,89 +570,94 @@ CycloneDDS domain 0               Fast-DDS domain 66/5
 | Action Bridge | `waic-action-bridge` |
 | FAST-LIO | `waic-fastlio` |
 
-### 部署 systemd
+### Install systemd Units
 
 ```bash
-# 工作站
+# Workstation
 cp systemd/workstation/*.service ~/.config/systemd/user/
-# 按需修改路径后:
+# After updating paths as needed:
 systemctl --user daemon-reload
 systemctl --user enable --now waic-taskmanger
 
-# Orin (从工作站推)
+# Orin (copy from the workstation)
 scp systemd/orin/*.service unitree@<orin_ip>:~/.config/systemd/user/
 ssh unitree@<orin_ip> "systemctl --user daemon-reload"
 ```
 
-### 启动顺序
+### Startup Order
 
-```
+```text
 1. Orin: waic-gateway, waic-fastlio, waic-zmq-bridge, waic-action-bridge
-2. 工作站: waic-goal-bridge
-3. 工作站: waic-navigation
-4. 工作站: waic-foundationpose
-5. 工作站: waic-taskmanger
-6. 手动: npm run dev (前端)
+2. Workstation: waic-goal-bridge
+3. Workstation: waic-navigation
+4. Workstation: waic-foundationpose
+5. Workstation: waic-taskmanger
+6. Manual: npm run dev (frontend)
 ```
 
-## 新工作站部署 Checklist
+## New Workstation Setup Checklist
 
-在另一台工作站上拉取后，按以下步骤操作：
+Follow these steps when setting up another workstation:
 
-- [ ] `git clone` + `git checkout replanning`
-- [ ] 安装 ROS2 Humble + conda + Node.js ≥ 18
+- [ ] Clone the repository and check out `main`
+- [ ] Install ROS2 Humble, conda, and Node.js ≥ 18
 - [ ] `colcon build --symlink-install`
-- [ ] 创建 `.venv` + `pip install -r requirements.txt`
-- [ ] 创建 conda env `foundationpose`（含 torch, FoundationPose 依赖）
-- [ ] 编辑 `robots.json`（填入实际机器人 IP/domain）
-- [ ] 生成 `active_robot.env`
-- [ ] 编辑 `scene_coords.json`（填入实际场地坐标）
+- [ ] Create `.venv` and run `pip install -r requirements.txt`
+- [ ] Create the `foundationpose` conda environment with PyTorch and FoundationPose dependencies
+- [ ] Edit `robots.json` with the actual robot IP addresses and domains
+- [ ] Generate `active_robot.env`
+- [ ] Edit `scene_coords.json` with the actual scene coordinates
 - [ ] `cd phi_robot_fronted && npm install && npm run build`
-- [ ] 部署 systemd 文件到 `~/.config/systemd/user/` 并按需改路径
-- [ ] 生成 SSH key `id_ed25519_waic`（用于 ssh 到 Orin）
-- [ ] 启动服务
+- [ ] Install the systemd units in `~/.config/systemd/user/` and update paths as needed
+- [ ] Generate the `id_ed25519_waic` SSH key for access to the Orin
+- [ ] Start the services
 
-## 常见问题
+## Troubleshooting
 
-**Q: 启动报 `ModuleNotFoundError: No module named 'rclpy'`**
+**Q: Startup fails with `ModuleNotFoundError: No module named 'rclpy'`.**
 
-需要先 source ROS2 环境：`source /opt/ros/humble/setup.bash`
+Source the ROS2 environment first: `source /opt/ros/humble/setup.bash`.
 
-**Q: FP 节点闪退，报 `AssertionError: matched_object_id must be in [-128, 127]`**
+**Q: The FP node crashes with `AssertionError: matched_object_id must be in [-128, 127]`.**
 
-tracker ID 溢出。需将 `SelectTarget.srv` 中 `matched_object_id` 和 `box_object_ids` 从 `int8` 改为 `int32`。
+The tracker ID has overflowed. Change `matched_object_id` and `box_object_ids`
+in `SelectTarget.srv` from `int8` to `int32`.
 
-**Q: FP 收不到 `/G1Env/env_state_act` 数据**
+**Q: FP does not receive `/G1Env/env_state_act` data.**
 
-QoS 不兼容。FP 订阅需用 `best_effort` 匹配 SONIC publisher 的 QoS。
+The QoS settings are incompatible. Use `best_effort` for the FP subscription to
+match the SONIC publisher's QoS.
 
-**Q: `/foundationpose/pose_results` frame_id 在 pelvis 和 torso_link 间交替**
+**Q: The `frame_id` in `/foundationpose/pose_results` alternates between pelvis and torso_link.**
 
-有多个 FP 节点实例在运行。`pkill -f foundationpose_node` 杀掉旧实例后重启。
+Multiple FP node instances are running. Stop the old instances with
+`pkill -f foundationpose_node`, then restart the node.
 
-**Q: 主页 RUN 后不自动执行**
+**Q: Clicking RUN on the main page does not start execution.**
 
-这是设计行为——主页只加载计划到 `StepDebugController`，执行由操作员在 debug.html 控制。
+This is intentional in the grid workflow: the main page only loads the plan into
+`StepDebugController`. The operator controls execution from `debug.html`.
 
-**Q: 机器人无响应**
+**Q: The robot does not respond.**
 
-1. 检查 DDS domain 一致：`echo $ROS_DOMAIN_ID`
-2. 检查双方在同一局域网：`ros2 node list`
-3. 检查 ZMQ bridge 是否在线：`systemctl --user status waic-zmq-bridge@<domain>`
+1. Verify that the DDS domains match: `echo $ROS_DOMAIN_ID`.
+2. Check that both systems are on the same local network: `ros2 node list`.
+3. Check the ZMQ bridge status: `systemctl --user status waic-zmq-bridge@<domain>`.
 
-**Q: 搬起箱子后无法走路**
+**Q: The robot cannot walk after lifting a box.**
 
-确认 `/locomotion_mode` 被正确设置为 `2`（携带行走模式）。Gateway 在 `carry_wait_walk` 状态下需要 mode=2 才能触发行走。
+Ensure that `/locomotion_mode` is set to `2` (carrying mode). Gateway requires
+mode 2 to start walking from the `carry_wait_walk` state.
 
-## Git 工作流
+## Git Workflow
 
+```text
+main
+  └── <feature-branch> → development → real-robot validation → merge
 ```
-replanning (当前开发分支)
-  └── <feature-branch> → 开发 → 真机验证 → 合并
-```
 
-| 规则 | 说明 |
+| Rule | Description |
 |------|------|
-| 提交格式 | `feat:` / `fix:` / `chore:` / `docs:` |
-| 禁止 force push 到 protected 分支 | |
-| `robot_state.py` 改动须双人确认 | SafetyStateMachine 影响真机安全 |
+| Commit prefixes | `feat:` / `fix:` / `chore:` / `docs:` |
+| Do not force-push to protected branches | |
+| Changes to `robot_state.py` require two-person review | SafetyStateMachine affects physical robot safety |
