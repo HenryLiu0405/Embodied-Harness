@@ -9,6 +9,10 @@
 > 未执行云调用、ROS、机器人动作或 HIL。除非 `.env` 显式设置
 > `PHI_AUTONOMY_ENABLED=1`，原真实 ROS 启动路径不会自动切换。
 
+## Demo
+
+https://github.com/user-attachments/assets/59934c96-b3b6-48cb-a8c2-f17d752b9a03
+
 ## 系统架构
 
 ```
